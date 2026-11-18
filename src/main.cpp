@@ -1,207 +1,325 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <DFRobotDFPlayerMini.h>
-#include <OneButton.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/timers.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 
-// Pins
+#define TAG "audio_player"
+
+// --- PINS ---
 #define DFPLAYER_RX_PIN 16
 #define DFPLAYER_TX_PIN 17
+#define BTN_LEFT_PIN    32
+#define BTN_MID_PIN     33
+#define BTN_RIGHT_PIN   13
+#define OLED_SDA_PIN    21
+#define OLED_SCL_PIN    22
 
-#define BTN_LEFT_PIN   32
-#define BTN_MID_PIN    33
-#define BTN_RIGHT_PIN  13
+// --- OLED CONFIG ---
+#define I2C_MASTER_NUM 0
+#define I2C_MASTER_FREQ_HZ 100000 
+#define OLED_ADDR 0x3C
 
-// OLED Setup
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// --- EVENTS ---
+typedef enum {
+    EV_LEFT_CLICK,
+    EV_RIGHT_CLICK,
+    EV_MID_CLICK,
+    EV_MID_DCLICK
+} app_event_t;
 
-// Audio & Buttons
-HardwareSerial mySerial(2);
-DFRobotDFPlayerMini myDFPlayer;
+static QueueHandle_t event_queue;
+static TimerHandle_t mid_click_timer;
 
-OneButton btnLeft(BTN_LEFT_PIN, true);
-OneButton btnMid(BTN_MID_PIN, true);
-OneButton btnRight(BTN_RIGHT_PIN, true);
+// --- APP STATE ---
+// The names that show on the screen
+static const char *const TRACKS[] = {
+    "Budots",
+    "Magbalik",
+    "Billie Jean",
+    "Pamela One brazil",
+    "Multo",
+    "Gangnam Style"
+};
 
-// Playlist Data (0001=Donkey, 0002=Goose, 0003=Sheep, 0004=Dog)
-const char* animals[] = {"Donkey", "Goose", "Sheep", "Dog"};
-const int numAnimals = sizeof(animals) / sizeof(animals[0]);
-int currentPos = 0;
+// Map each OLED title to the DFPlayer track observed on the SD card.
+static const uint8_t TRACK_MAP[] = {4, 6, 2, 1, 5, 3};
 
-// Player State
-bool isPlaylistMode = true; // true = Playlist Mode, false = Volume Mode
-bool isPlaying = false;
-bool isPaused = false;
-bool isMuted = false;
-int volume = 12;            // Safe default for 0.5W speaker (0-30)
-int savedVolume = 12;
+#define NUM_TRACKS (sizeof(TRACKS) / sizeof(TRACKS[0]))
 
-void updateOLED() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+static int s_pos = 0;
+static bool s_playlist_mode = true;
+static bool s_playing = false;
+static bool s_paused = false;
+static bool s_muted = false;
+static int s_volume = 12;
+static int s_saved_volume = 12;
 
-  // 1. Top Header: Active Mode
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  if (isPlaylistMode) {
-    display.print("MODE: [PLAYLIST]");
-  } else {
-    display.print("MODE: [VOLUME]");
-  }
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+// ================= OLED FRAMEBUFFER & DRAWING =================
+static uint8_t framebuffer[1024];
 
-  // 2. Center: Animal Name
-  display.setTextSize(2);
-  display.setCursor(0, 18);
-  display.println(animals[currentPos]);
+static void oled_init() {
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = (gpio_num_t)OLED_SDA_PIN;
+    conf.scl_io_num = (gpio_num_t)OLED_SCL_PIN;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
 
-  // 3. Status: Playing / Paused
-  display.setTextSize(1);
-  display.setCursor(0, 40);
-  display.print("Status: ");
-  display.println(isPlaying ? "Playing" : "Paused");
-
-  // 4. Bottom: Volume Bar & Level
-  display.setCursor(0, 53);
-  display.print("Vol:");
-  int barWidth = map(isMuted ? 0 : volume, 0, 30, 0, 70);
-  display.drawRect(28, 53, 72, 8, SSD1306_WHITE);
-  if (barWidth > 0) {
-    display.fillRect(29, 54, barWidth, 6, SSD1306_WHITE);
-  }
-  display.setCursor(104, 53);
-  if (isMuted) {
-    display.print("MUTE");
-  } else {
-    display.print(volume);
-  }
-
-  display.display();
-}
-
-void playCurrentTrack() {
-  myDFPlayer.play(currentPos + 1); // DFPlayer tracks are 1-indexed
-  isPlaying = true;
-  isPaused = false;
-  updateOLED();
-}
-
-void onLeftClick() {
-  if (isPlaylistMode) {
-    currentPos = (currentPos + numAnimals - 1) % numAnimals;
-    playCurrentTrack();
-  } else {
-    if (isMuted) {
-      isMuted = false;
-      volume = savedVolume;
+    i2c_param_config((i2c_port_t)I2C_MASTER_NUM, &conf);
+    i2c_driver_install((i2c_port_t)I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    
+    uint8_t init_cmds[] = {
+        0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00, 
+        0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF
+    };
+    for (int i = 0; i < sizeof(init_cmds); i++) {
+        uint8_t buf[2] = {0x00, init_cmds[i]};
+        i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, buf, 2, pdMS_TO_TICKS(10));
     }
-    volume = max(0, volume - 3);
-    myDFPlayer.volume(volume);
-    updateOLED();
-  }
 }
 
-void onRightClick() {
-  if (isPlaylistMode) {
-    currentPos = (currentPos + 1) % numAnimals;
-    playCurrentTrack();
-  } else {
-    if (isMuted) {
-      isMuted = false;
-      volume = savedVolume;
+static void oled_flush() {
+    uint8_t cmd[3] = {0x00, 0x21, 0x00};
+    i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, cmd, 3, pdMS_TO_TICKS(10));
+    cmd[1] = 0x7F;
+    i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, cmd, 3, pdMS_TO_TICKS(10));
+    cmd[1] = 0x22; cmd[2] = 0x00;
+    i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, cmd, 3, pdMS_TO_TICKS(10));
+    cmd[1] = 0x07;
+    i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, cmd, 3, pdMS_TO_TICKS(10));
+    
+    uint8_t data_buf[129];
+    data_buf[0] = 0x40;
+    for (int i = 0; i < 1024; i += 128) {
+        memcpy(&data_buf[1], &framebuffer[i], 128);
+        i2c_master_write_to_device((i2c_port_t)I2C_MASTER_NUM, OLED_ADDR, data_buf, 129, pdMS_TO_TICKS(20));
     }
-    volume = min(30, volume + 3);
-    myDFPlayer.volume(volume);
-    updateOLED();
-  }
 }
 
-void onMidClick() {
-  if (isPlaylistMode) {
-    if (isPlaying) {
-      myDFPlayer.pause();
-      isPlaying = false;
-      isPaused = true;
-    } else if (isPaused) {
-      myDFPlayer.start(); // Resume
-      isPlaying = true;
-      isPaused = false;
+static void fb_clear() { memset(framebuffer, 0, sizeof(framebuffer)); }
+
+static void fb_set_pixel(int x, int y, bool color) {
+    if (x < 0 || x >= 128 || y < 0 || y >= 64) return;
+    if (color) framebuffer[x + (y / 8) * 128] |= (1 << (y % 8));
+    else framebuffer[x + (y / 8) * 128] &= ~(1 << (y % 8));
+}
+
+static void fb_draw_hline(int x, int y, int w) {
+    for (int i = 0; i < w; i++) fb_set_pixel(x + i, y, true);
+}
+
+static void fb_draw_rect(int x, int y, int w, int h) {
+    for (int i = 0; i < w; i++) {
+        fb_set_pixel(x + i, y, true);
+        fb_set_pixel(x + i, y + h - 1, true);
+    }
+    for (int i = 0; i < h; i++) {
+        fb_set_pixel(x, y + i, true);
+        fb_set_pixel(x + w - 1, y + i, true);
+    }
+}
+
+static void fb_fill_rect(int x, int y, int w, int h) {
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            fb_set_pixel(x + i, y + j, true);
+        }
+    }
+}
+
+static const uint8_t font8x8[][8] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},{0x00, 0x00, 0x00, 0x4F, 0x00, 0x00, 0x00, 0x00},{0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00},{0x14, 0x7F, 0x14, 0x7F, 0x14, 0x00, 0x00, 0x00},{0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x00, 0x00, 0x00},{0x23, 0x13, 0x08, 0x64, 0x62, 0x00, 0x00, 0x00},{0x36, 0x49, 0x55, 0x22, 0x50, 0x00, 0x00, 0x00},{0x00, 0x05, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00},{0x00, 0x1C, 0x22, 0x41, 0x00, 0x00, 0x00, 0x00},{0x00, 0x41, 0x22, 0x1C, 0x00, 0x00, 0x00, 0x00},{0x14, 0x08, 0x3E, 0x08, 0x14, 0x00, 0x00, 0x00},{0x08, 0x08, 0x3E, 0x08, 0x08, 0x00, 0x00, 0x00},{0x00, 0x50, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00},{0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00, 0x00},{0x00, 0x60, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00},{0x20, 0x10, 0x08, 0x04, 0x02, 0x00, 0x00, 0x00},{0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x00, 0x00},{0x00, 0x42, 0x7F, 0x40, 0x00, 0x00, 0x00, 0x00},{0x42, 0x61, 0x51, 0x49, 0x46, 0x00, 0x00, 0x00},{0x21, 0x41, 0x45, 0x4B, 0x31, 0x00, 0x00, 0x00},{0x18, 0x14, 0x12, 0x7F, 0x10, 0x00, 0x00, 0x00},{0x27, 0x45, 0x45, 0x45, 0x39, 0x00, 0x00, 0x00},{0x3C, 0x4A, 0x49, 0x49, 0x30, 0x00, 0x00, 0x00},{0x01, 0x71, 0x09, 0x05, 0x03, 0x00, 0x00, 0x00},{0x36, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00},{0x06, 0x49, 0x49, 0x29, 0x1E, 0x00, 0x00, 0x00},{0x00, 0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00},{0x00, 0x56, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00},{0x08, 0x14, 0x22, 0x41, 0x00, 0x00, 0x00, 0x00},{0x14, 0x14, 0x14, 0x14, 0x14, 0x00, 0x00, 0x00},{0x00, 0x41, 0x22, 0x14, 0x08, 0x00, 0x00, 0x00},{0x02, 0x01, 0x51, 0x09, 0x06, 0x00, 0x00, 0x00},{0x32, 0x49, 0x79, 0x41, 0x3E, 0x00, 0x00, 0x00},{0x7E, 0x11, 0x11, 0x11, 0x7E, 0x00, 0x00, 0x00},{0x7F, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00},{0x3E, 0x41, 0x41, 0x41, 0x22, 0x00, 0x00, 0x00},{0x7F, 0x41, 0x41, 0x22, 0x1C, 0x00, 0x00, 0x00},{0x7F, 0x49, 0x49, 0x49, 0x41, 0x00, 0x00, 0x00},{0x7F, 0x09, 0x09, 0x09, 0x01, 0x00, 0x00, 0x00},{0x3E, 0x41, 0x49, 0x49, 0x7A, 0x00, 0x00, 0x00},{0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00, 0x00, 0x00},{0x00, 0x41, 0x7F, 0x41, 0x00, 0x00, 0x00, 0x00},{0x20, 0x40, 0x41, 0x3F, 0x01, 0x00, 0x00, 0x00},{0x7F, 0x08, 0x14, 0x22, 0x41, 0x00, 0x00, 0x00},{0x7F, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00},{0x7F, 0x02, 0x0C, 0x02, 0x7F, 0x00, 0x00, 0x00},{0x7F, 0x04, 0x08, 0x10, 0x7F, 0x00, 0x00, 0x00},{0x3E, 0x41, 0x41, 0x41, 0x3E, 0x00, 0x00, 0x00},{0x7F, 0x09, 0x09, 0x09, 0x06, 0x00, 0x00, 0x00},{0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00, 0x00, 0x00},{0x7F, 0x09, 0x19, 0x29, 0x46, 0x00, 0x00, 0x00},{0x46, 0x49, 0x49, 0x49, 0x31, 0x00, 0x00, 0x00},{0x01, 0x01, 0x7F, 0x01, 0x01, 0x00, 0x00, 0x00},{0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00, 0x00, 0x00},{0x1F, 0x20, 0x40, 0x20, 0x1F, 0x00, 0x00, 0x00},{0x3F, 0x40, 0x38, 0x40, 0x3F, 0x00, 0x00, 0x00},{0x63, 0x14, 0x08, 0x14, 0x63, 0x00, 0x00, 0x00},{0x07, 0x08, 0x70, 0x08, 0x07, 0x00, 0x00, 0x00},{0x61, 0x51, 0x49, 0x45, 0x43, 0x00, 0x00, 0x00},{0x00, 0x7F, 0x41, 0x41, 0x00, 0x00, 0x00, 0x00},{0x02, 0x04, 0x08, 0x10, 0x20, 0x00, 0x00, 0x00},{0x00, 0x41, 0x41, 0x7F, 0x00, 0x00, 0x00, 0x00},{0x04, 0x02, 0x01, 0x02, 0x04, 0x00, 0x00, 0x00},{0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00},{0x00, 0x01, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00},{0x20, 0x54, 0x54, 0x54, 0x78, 0x00, 0x00, 0x00},{0x7F, 0x48, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00},{0x38, 0x44, 0x44, 0x44, 0x20, 0x00, 0x00, 0x00},{0x38, 0x44, 0x44, 0x48, 0x7F, 0x00, 0x00, 0x00},{0x38, 0x54, 0x54, 0x54, 0x18, 0x00, 0x00, 0x00},{0x08, 0x7E, 0x09, 0x01, 0x02, 0x00, 0x00, 0x00},{0x0C, 0x52, 0x52, 0x52, 0x3E, 0x00, 0x00, 0x00},{0x7F, 0x08, 0x04, 0x04, 0x78, 0x00, 0x00, 0x00},{0x00, 0x44, 0x7D, 0x40, 0x00, 0x00, 0x00, 0x00},{0x20, 0x40, 0x44, 0x3D, 0x00, 0x00, 0x00, 0x00},{0x7F, 0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00},{0x00, 0x41, 0x7F, 0x40, 0x00, 0x00, 0x00, 0x00},{0x7C, 0x04, 0x18, 0x04, 0x78, 0x00, 0x00, 0x00},{0x7C, 0x08, 0x04, 0x04, 0x78, 0x00, 0x00, 0x00},{0x38, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00},{0x7C, 0x14, 0x14, 0x14, 0x08, 0x00, 0x00, 0x00},{0x08, 0x14, 0x14, 0x18, 0x7C, 0x00, 0x00, 0x00},{0x7C, 0x08, 0x04, 0x04, 0x08, 0x00, 0x00, 0x00},{0x48, 0x54, 0x54, 0x54, 0x20, 0x00, 0x00, 0x00},{0x04, 0x3F, 0x44, 0x40, 0x20, 0x00, 0x00, 0x00},{0x3C, 0x40, 0x40, 0x20, 0x7C, 0x00, 0x00, 0x00},{0x1C, 0x20, 0x40, 0x20, 0x1C, 0x00, 0x00, 0x00},{0x3C, 0x40, 0x30, 0x40, 0x3C, 0x00, 0x00, 0x00},{0x44, 0x28, 0x10, 0x28, 0x44, 0x00, 0x00, 0x00},{0x0C, 0x50, 0x50, 0x50, 0x3C, 0x00, 0x00, 0x00},{0x44, 0x64, 0x54, 0x4C, 0x44, 0x00, 0x00, 0x00},
+};
+
+static void fb_draw_text(int x, int y, const char* text, int scale) {
+    while (*text) {
+        char c = *text++;
+        if (c < 32 || c > 122) c = 32;
+        int idx = c - 32;
+        for (int i = 0; i < 8; i++) {
+            uint8_t col = font8x8[idx][i];
+            for (int j = 0; j < 8; j++) {
+                if (col & (1 << j)) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        for (int sy = 0; sy < scale; sy++) {
+                            fb_set_pixel(x + (i * scale) + sx, y + (j * scale) + sy, true);
+                        }
+                    }
+                }
+            }
+        }
+        x += 8 * scale;
+    }
+}
+
+static void draw_ui() {
+    fb_clear();
+    fb_draw_text(0, 0, s_playlist_mode ? "MODE: [PLAYLIST]" : "MODE: [VOLUME]", 1);
+    fb_draw_hline(0, 9, 128);
+    
+    int name_len = strlen(TRACKS[s_pos]);
+    int name_scale = (name_len <= 8) ? 2 : 1;
+    int name_x = (128 - (name_len * 8 * name_scale)) / 2;
+    fb_draw_text(name_x, 20, TRACKS[s_pos], name_scale);
+    
+    char status_buf[32];
+    snprintf(status_buf, sizeof(status_buf), "Status: %s", s_playing ? "Playing" : "Paused");
+    fb_draw_text(0, 40, status_buf, 1);
+    
+    fb_draw_text(0, 56, "Vol:", 1);
+    fb_draw_rect(24, 56, 72, 8);
+    int fill_width = (s_muted ? 0 : s_volume) * 70 / 30;
+    if (fill_width > 0) fb_fill_rect(25, 57, fill_width, 6);
+    
+    if (s_muted) {
+        fb_draw_text(100, 56, "MUTE", 1);
     } else {
-      playCurrentTrack();
+        snprintf(status_buf, sizeof(status_buf), "%d", s_volume);
+        fb_draw_text(104, 56, status_buf, 1);
     }
-    updateOLED();
-  } else {
-    isMuted = !isMuted;
-    if (isMuted) {
-      savedVolume = volume;
-      myDFPlayer.volume(0);
-    } else {
-      volume = savedVolume;
-      myDFPlayer.volume(volume);
-    }
-    updateOLED();
-  }
+    oled_flush();
 }
 
-void onMidDoubleClick() {
-  isPlaylistMode = !isPlaylistMode;
-  updateOLED();
+// ================= DFPLAYER (UART) =================
+static void dfplayer_init() {
+    uart_config_t uart_config = {
+        .baud_rate = 9600, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(UART_NUM_2, &uart_config);
+    uart_set_pin(UART_NUM_2, DFPLAYER_TX_PIN, DFPLAYER_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_NUM_2, 256, 0, 0, NULL, 0);
+    
+    vTaskDelay(pdMS_TO_TICKS(3000)); // CRITICAL BOOT DELAY
 }
 
-void setup() {
-  Serial.begin(115200);
-
-  // Init OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("Error: OLED failed to initialize.");
-    while (true);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 25);
-  display.println("Initializing Audio...");
-  display.display();
-
-  // Init DFPlayer
-  mySerial.begin(9600, SERIAL_8N1, DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
-  if (!myDFPlayer.begin(mySerial)) {
-    Serial.println("Error: DFPlayer failed to initialize.");
-    display.clearDisplay();
-    display.setCursor(0, 25);
-    display.println("DFPlayer Error!");
-    display.display();
-    while (true);
-  }
-
-  myDFPlayer.volume(volume);
-  delay(200);
-
-  // Attach Buttons
-  btnLeft.attachClick(onLeftClick);
-  btnRight.attachClick(onRightClick);
-  btnMid.attachClick(onMidClick);
-  btnMid.attachDoubleClick(onMidDoubleClick);
-
-  Serial.println("Audio Player Ready!");
-  updateOLED();
+static void dfplayer_cmd(uint8_t cmd, uint8_t param) {
+    uint8_t buf[10] = {0x7E, 0xFF, 0x06, cmd, 0x00, 0x00, param, 0x00, 0x00, 0xEF};
+    uint16_t sum = 0;
+    for (int i = 1; i < 7; i++) sum += buf[i];
+    uint16_t chk = (uint16_t)(0 - sum);
+    buf[7] = chk >> 8;
+    buf[8] = chk & 0xFF;
+    uart_write_bytes(UART_NUM_2, (const char*)buf, 10);
+    vTaskDelay(pdMS_TO_TICKS(30)); // module needs a gap between commands
 }
 
-void loop() {
-  btnLeft.tick();
-  btnMid.tick();
-  btnRight.tick();
+// ================= BUTTONS & TIMERS =================
+static void mid_click_timer_cb(TimerHandle_t xTimer) {
+    app_event_t ev = EV_MID_CLICK;
+    xQueueSend(event_queue, &ev, 0);
+}
 
-  // Check DFPlayer serial events when track finishes
-  if (myDFPlayer.available()) {
-    uint8_t type = myDFPlayer.readType();
-    if (type == DFPlayerPlayFinished) {
-      isPlaying = false;
-      isPaused = false;
-      updateOLED();
+static void IRAM_ATTR btn_isr_handler(void* arg) {
+    static int64_t last_us[40];
+    int64_t now = esp_timer_get_time();
+    if (now - last_us[(uint32_t)arg] < 50000) return; // ignore edges within 50 ms
+    last_us[(uint32_t)arg] = now;
+
+    uint32_t gpio_num = (uint32_t)arg;
+    app_event_t ev;
+    
+    if (gpio_num == BTN_LEFT_PIN) { ev = EV_LEFT_CLICK; xQueueSendFromISR(event_queue, &ev, NULL); }
+    else if (gpio_num == BTN_RIGHT_PIN) { ev = EV_RIGHT_CLICK; xQueueSendFromISR(event_queue, &ev, NULL); }
+    else if (gpio_num == BTN_MID_PIN) { 
+        if (xTimerIsTimerActive(mid_click_timer) != pdFALSE) {
+            xTimerStopFromISR(mid_click_timer, NULL);
+            ev = EV_MID_DCLICK;
+            xQueueSendFromISR(event_queue, &ev, NULL);
+        } else {
+            xTimerChangePeriodFromISR(mid_click_timer, pdMS_TO_TICKS(350), NULL);
+            xTimerStartFromISR(mid_click_timer, NULL);
+        }
     }
-  }
+}
+
+static void buttons_init() {
+    mid_click_timer = xTimerCreate("mid_click", pdMS_TO_TICKS(350), pdFALSE, (void*)0, mid_click_timer_cb);
+
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL<<BTN_LEFT_PIN) | (1ULL<<BTN_MID_PIN) | (1ULL<<BTN_RIGHT_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE; 
+    gpio_config(&io_conf);
+    
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add((gpio_num_t)BTN_LEFT_PIN, btn_isr_handler, (void*)BTN_LEFT_PIN);
+    gpio_isr_handler_add((gpio_num_t)BTN_MID_PIN, btn_isr_handler, (void*)BTN_MID_PIN);
+    gpio_isr_handler_add((gpio_num_t)BTN_RIGHT_PIN, btn_isr_handler, (void*)BTN_RIGHT_PIN);
+}
+
+// ================= MAIN APP =================
+extern "C" void app_main(void) {
+    event_queue = xQueueCreate(10, sizeof(app_event_t));
+    
+    oled_init();
+    buttons_init();
+    dfplayer_init(); 
+    
+    dfplayer_cmd(0x06, s_volume); 
+    draw_ui();
+
+    while (true) {
+        app_event_t ev;
+        if (xQueueReceive(event_queue, &ev, portMAX_DELAY)) {
+            
+            if (ev == EV_MID_DCLICK) {
+                s_playlist_mode = !s_playlist_mode;
+            } 
+            else if (ev == EV_MID_CLICK) {
+                if (s_playlist_mode) {
+                    if (s_playing) { 
+                        dfplayer_cmd(0x0E, 0); s_playing = false; s_paused = true; 
+                    } else if (s_paused) { 
+                        dfplayer_cmd(0x0D, 0); s_playing = true; s_paused = false; 
+                    } else { 
+                        dfplayer_cmd(0x03, TRACK_MAP[s_pos]); 
+                        s_playing = true; s_paused = false; 
+                    }
+                } else {
+                    s_muted = !s_muted;
+                    if(s_muted) { 
+                        s_saved_volume = s_volume; dfplayer_cmd(0x06, 0); 
+                    } else { 
+                        s_volume = s_saved_volume; dfplayer_cmd(0x06, s_volume); 
+                    }
+                }
+            } 
+            else if (ev == EV_LEFT_CLICK) {
+                if (s_playlist_mode) { 
+                    s_pos = (s_pos + NUM_TRACKS - 1) % NUM_TRACKS; 
+                    dfplayer_cmd(0x03, TRACK_MAP[s_pos]); 
+                    s_playing=true; s_paused=false; 
+                } else { 
+                    if (s_muted) { s_muted = false; s_volume = s_saved_volume; }
+                    s_volume = (s_volume >= 3) ? s_volume - 3 : 0; 
+                    dfplayer_cmd(0x06, s_volume); 
+                }
+            }
+            else if (ev == EV_RIGHT_CLICK) {
+                if (s_playlist_mode) { 
+                    s_pos = (s_pos + 1) % NUM_TRACKS; 
+                    dfplayer_cmd(0x03, TRACK_MAP[s_pos]); 
+                    s_playing=true; s_paused=false; 
+                } else { 
+                    if (s_muted) { s_muted = false; s_volume = s_saved_volume; }
+                    s_volume = (s_volume <= 27) ? s_volume + 3 : 30; 
+                    dfplayer_cmd(0x06, s_volume); 
+                }
+            }
+            
+            draw_ui();
+        }
+    }
 }
